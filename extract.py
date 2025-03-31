@@ -5,56 +5,143 @@ def read_concepts_from_csv(csv_file):
     concepts = {}
     
     with open(csv_file, newline='', encoding='utf-8') as csvfile:
-        reader = csv.reader(csvfile)
-        headers = next(reader)  
-        
+        reader = csv.DictReader(csvfile)
         for row in reader:
-            concept = row[0]  # Nom du concept (par exemple "acteur", "titre", etc.)
-            values = row[1:]  # Les valeurs associées à ce concept (noms d'acteurs, titres, etc.)
-            concepts[concept] = values
-    
+            for header, value in row.items():
+                if header not in concepts:
+                    concepts[header] = set()
+                parts = [v.strip() for v in value.split(',') if v.strip()]
+                for part in parts:
+                    concepts[header].add(part)
+        for header in concepts:
+            concepts[header] = list(concepts[header])
     return concepts
 
-# Fonction de string matching pour identifier les concepts dans la requête
 def extract_concepts(query, concepts):
-    concepts_found = []
+    found = {}
+    matched_values = set()
     
-    # Recherche de chaque concept dans la requête
-    for concept, fields in concepts.items():
-        for field in fields:
-            if re.search(r'\b' + re.escape(field) + r'\b', query, re.IGNORECASE):
-                concepts_found.append((concept, field))
-    
-    return concepts_found
+    for concept, values in concepts.items():
+        for value in values:
+            if value in matched_values: 
+                continue
+            pattern = r'\b' + re.escape(value) + r'\b'
+            if re.search(pattern, query, re.IGNORECASE):
+                if concept not in found:
+                    found[concept] = []
+                found[concept].append(value)
+                matched_values.add(value)  
+    return found
 
-# Fonction pour extraire l'intention (SELECT et WHERE)
-def extract_intentions(query):
+def extract_intentions(query, concepts):
     select_intent = None
-    where_intent = None
     
-    # Rechercher le SELECT dans la requête (selon la logique de la phrase)
-    if re.search(r'\b(titre|film|films)\b', query, re.IGNORECASE):
-        select_intent = 'SELECT'
+    select_match = re.search(
+        r'\b(montrer|afficher|donner|voir|liste)\s+(le|les|l\'|la)?\s*(\w+)',
+        query,
+        re.IGNORECASE
+    )
+    if select_match:
+        target = select_match.group(3).lower()
+        for concept in concepts:
+            if concept.lower() == target:
+                select_intent = concept
+                break
+    
+    where_part = query
+    where_clauses = {}
+    if 'où' in query.lower():
+        parts = re.split(r'\boù\b', query, flags=re.IGNORECASE)
+        if len(parts) > 1:
+            where_part = parts[1].strip()  
+    where_clauses = extract_concepts(where_part, concepts)
+    
+    return select_intent, where_clauses
 
-    # Rechercher le WHERE dans la requête (selon la présence de conditions comme "où")
-    if re.search(r'\b(où|where|dans)\b', query, re.IGNORECASE):
-        where_intent = 'WHERE'
-        
-    return select_intent, where_intent
-
-# Charger les concepts depuis le fichier CSV
-csv_file = 'base_films_500.csv'  # Remplacez par le chemin de votre fichier CSV
+csv_file = 'base_films_500.csv'  
 concepts = read_concepts_from_csv(csv_file)
 
-# Tester pour une seule requête en langage naturel
-query_french = "Veuillez me montrer le titre des films où Meryl Streep joue et Hugh Jackman joue."
+query_french = "Veuillez me montrer le titre des films où Meryl Streep joue après 2005."
+select_intent, where_intent = extract_intentions(query_french, concepts)
 
-# Extraire les concepts et intentions
-concepts_found = extract_concepts(query_french, concepts)
-select_intent, where_intent = extract_intentions(query_french)
-
-# Afficher les résultats
 print(f"Requête: {query_french}")
-print(f"Concepts trouvés: {concepts_found}")
 print(f"Intention SELECT: {select_intent}")
 print(f"Intention WHERE: {where_intent}")
+
+
+import json
+import re
+
+def parse_sql_query(sql):
+    intent = {'select': [], 'where': ''}
+    
+    try:
+        select_match = re.search(r"SELECT\s+(.*?)\s+FROM", sql, re.IGNORECASE)
+        if select_match:
+            select_part = select_match.group(1).strip()
+            if select_part == '*':
+                intent['select'] = ['*']
+            else:
+                columns = [c.strip().split(' AS ')[0] for c in select_part.split(',')]
+                columns = [re.sub(r'\(.*?\)', '', c).strip() for c in columns]
+                columns = [c.split('.')[-1] for c in columns]  # Enlève les alias de table
+                intent['select'] = [c for c in columns if c]
+        
+        where_match = re.search(r"WHERE\s+(.*)", sql, re.IGNORECASE | re.DOTALL)
+        if where_match:
+            where_clause = where_match.group(1).strip()
+            where_clause = re.sub(r'^\(\((.*)\)\)$', r'\1', where_clause)  # Enlève les doubles parenthèses
+            where_clause = re.sub(r'\s+', ' ', where_clause)  # Normalise les espaces
+            intent['where'] = normalize_where_clause(where_clause)
+        
+    except Exception as e:
+        print(f"Erreur lors de l'analyse de la requête : {sql}")
+        print(e)
+    
+    return intent
+
+def normalize_where_clause(where_clause):
+    where_clause = re.sub(r"'[^']*'", "'name'", where_clause)
+    
+    where_clause = re.sub(r'\b(acteur[123])\b', 'acteur', where_clause)
+    
+    where_clause = re.sub(r'=\s*"', '= ', where_clause)  # Pour les cas avec guillemets
+    
+    return where_clause
+
+def generate_intents_from_json(json_file):
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    queries = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and 'sql' in item:
+                queries.append(item['sql'])
+    
+    intents = []
+    for idx, query in enumerate(queries, 1):
+        parsed = parse_sql_query(query)
+        if parsed['select'] or parsed['where']:
+            intent_name = f'intent{idx}'
+            intents.append({
+                intent_name: {
+                    'select': parsed['select'],
+                    'where': parsed['where']
+                }
+            })
+    
+    return intents
+
+json_file = 'queries_french_para.json' 
+
+intents = generate_intents_from_json(json_file)
+
+for intent in intents:
+    for name, clauses in intent.items():
+        select = f"select={clauses['select']}" if clauses['select'] else ""
+        where = f"where='{clauses['where']}'" if clauses['where'] else ""
+        print(f"— {name} : {select}; {where}")
+
+
+
