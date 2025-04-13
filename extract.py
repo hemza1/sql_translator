@@ -176,3 +176,40 @@ for intent in intents:
         select = f"select={list(set(clauses['select']))}" if clauses['select'] else ""
         where = f"where='{clauses['where']}'" if clauses['where'] else ""
         print(f"{select}; {where}")
+
+
+
+def generate_training_dataset(json_file, output_csv):
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    rows = []
+    for entry in data:
+        sql = entry.get('sql')
+        if not sql:
+            continue
+
+        parsed = parse_sql_query(sql)
+        select_label = f"select={sorted(parsed['select'])}"
+        where_label = f"where='{parsed['where']}'"
+
+        # On prend la requête principale + les paraphrases
+        all_queries = []
+
+        if "french" in entry:
+            if "query_french" in entry["french"]:
+                all_queries.append(entry["french"]["query_french"])
+            if "paraphrase_french" in entry["french"]:
+                all_queries.extend(entry["french"]["paraphrase_french"])
+
+        for q in all_queries:
+            rows.append((q, select_label, where_label))
+
+    # Écriture dans un fichier CSV
+    with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['query_french', 'select_label', 'where_label'])
+        writer.writerows(rows)
+
+    print(f"✅ Fichier d'entraînement généré : {output_csv}")
+generate_training_dataset("queries_french_para.json", "training_dataset.csv")
